@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Security Agent</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="logo">
+        <div class="shield-icon">&#x1F6E1;</div>
+        <div>
+          <h1>AI Security Agent</h1>
+          <span class="subtitle">DigiTech DLP</span>
+        </div>
+      </div>
+      <div id="status-badge" class="status-badge active">Active</div>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-number" id="total-scans">0</div>
+        <div class="stat-label">Scans</div>
+      </div>
+      <div class="stat-card blocked">
+        <div class="stat-number" id="total-blocked">0</div>
+        <div class="stat-label">Blocked</div>
+      </div>
+      <div class="stat-card warning">
+        <div class="stat-number" id="total-warnings">0</div>
+        <div class="stat-label">Warnings</div>
+      </div>
+    </div>
+
+    <!-- Current Page Status -->
+    <div id="current-page" class="current-page">
+      <div class="page-status" id="page-status">
+        <span class="status-dot safe"></span>
+        <span id="page-status-text">Checking current page...</span>
+      </div>
+    </div>
+
+    <!-- Recent Events -->
+    <div class="section">
+      <h2>Recent Activity</h2>
+      <div id="events-list" class="events-list">
+        <div class="empty-state">No events yet. Browse normally — the agent monitors in the background.</div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      <span>v1.0.0</span>
+      <a href="#" id="settings-link">Settings</a>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

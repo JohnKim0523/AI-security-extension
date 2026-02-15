@@ -1,0 +1,13 @@
+{
+  "name": "ai-security",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-powered browser security agent — DLP for LLM/AI tools",
+  "scripts": {
+    "install:all": "cd extension && npm install && cd ../backend && npm install",
+    "dev:extension": "cd extension && npm run dev",
+    "dev:backend": "cd backend && npm run start:dev",
+    "build:extension": "cd extension && npm run build",
+    "build:backend": "cd backend && npm run build"
+  }
+}
