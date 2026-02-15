@@ -11,7 +11,8 @@
     "clipboardRead"
   ],
   "host_permissions": [
-    "http://localhost:3001/*"
+    "http://localhost:3001/*",
+    "https://ai-security-extension-production.up.railway.app/*"
   ],
   "background": {
     "service_worker": "background.js"

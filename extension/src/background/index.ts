@@ -18,8 +18,8 @@ let stats: DLPStats = {
   recentEvents: [],
 };
 
-// Backend API URL (configurable)
-const API_BASE_URL = 'http://localhost:3001';
+// Backend API URL
+const API_BASE_URL = 'https://ai-security-extension-production.up.railway.app';
 
 // ─── MESSAGE HANDLER ─────────────────────────────────────────────
 // Listens for messages from content scripts (like a NestJS controller)
