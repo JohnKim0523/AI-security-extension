@@ -1,5 +1,5 @@
 import { DLPEngine } from './dlp-engine';
-import { getAIToolName } from '../shared/patterns';
+import { getAIToolName, SENSITIVE_DOWNLOAD_EXTENSIONS } from '../shared/patterns';
 import { SecurityEvent, DLPStats, ExtensionMessage, DLPMatch, Action } from '../shared/types';
 
 // =============================================================================
@@ -161,6 +161,82 @@ function showNotification(matches: DLPMatch[]) {
     priority: 2,
   });
 }
+
+// ─── DOWNLOAD MONITORING ────────────────────────────────────────
+// Monitor downloads originating from AI tool domains
+chrome.downloads.onCreated.addListener((downloadItem) => {
+  const referrer = downloadItem.referrer || '';
+  const url = downloadItem.url || '';
+  const filename = downloadItem.filename || '';
+
+  // Check if download originated from an AI tool domain
+  let aiToolName: string | null = null;
+  try {
+    if (referrer) {
+      const refUrl = new URL(referrer);
+      aiToolName = getAIToolName(refUrl.hostname);
+    }
+    if (!aiToolName && url) {
+      const dlUrl = new URL(url);
+      aiToolName = getAIToolName(dlUrl.hostname);
+    }
+  } catch {
+    // Invalid URL, skip
+  }
+
+  if (!aiToolName) return;
+
+  // Determine severity based on file extension
+  const ext = '.' + filename.split('.').pop()?.toLowerCase();
+  const isSensitive = SENSITIVE_DOWNLOAD_EXTENSIONS.includes(ext);
+
+  const severity: 'HIGH' | 'MEDIUM' = isSensitive ? 'HIGH' : 'MEDIUM';
+
+  console.log(`[DLP] Download from ${aiToolName}: ${filename} (${severity})`);
+
+  const event: SecurityEvent = {
+    id: crypto.randomUUID(),
+    type: 'DOWNLOAD_FROM_AI',
+    matches: [{
+      type: `Download from ${aiToolName}`,
+      category: 'Data Exfiltration',
+      severity,
+      action: isSensitive ? 'BLOCK_LOG' : 'WARN_LOG',
+      matchedText: filename,
+      context: `File: ${filename}, Source: ${aiToolName}, URL: ${url.substring(0, 200)}`,
+      timestamp: Date.now(),
+    }],
+    url: referrer || url,
+    domain: aiToolName,
+    action: isSensitive ? 'BLOCK_LOG' : 'WARN_LOG',
+    userAgent: navigator.userAgent,
+    timestamp: Date.now(),
+  };
+
+  // Track stats
+  if (isSensitive) {
+    stats.totalWarnings++;
+  }
+
+  stats.recentEvents.unshift(event);
+  if (stats.recentEvents.length > 50) {
+    stats.recentEvents = stats.recentEvents.slice(0, 50);
+  }
+
+  chrome.storage.local.set({ dlpStats: stats });
+  sendEventToBackend(event);
+
+  // Show notification for sensitive file downloads
+  if (isSensitive) {
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon-48.png',
+      title: 'AI Tool Download Detected',
+      message: `Sensitive file downloaded from ${aiToolName}: ${filename}`,
+      priority: 2,
+    });
+  }
+});
 
 // ─── STARTUP ────────────────────────────────────────────────────
 // Load persisted stats on startup

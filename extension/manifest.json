@@ -8,7 +8,8 @@
     "storage",
     "notifications",
     "tabs",
-    "clipboardRead"
+    "clipboardRead",
+    "downloads"
   ],
   "host_permissions": [
     "http://localhost:3001/*",
@@ -36,7 +37,8 @@
         "*://codeium.com/*"
       ],
       "js": ["prompt-interceptor.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     },
     {
       "matches": ["<all_urls>"],

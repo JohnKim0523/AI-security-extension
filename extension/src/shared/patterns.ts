@@ -283,6 +283,139 @@ export const DETECTION_PATTERNS: DetectionPattern[] = [
   },
 ];
 
+// =============================================================================
+// ENCODING EVASION DETECTION
+// Pre-processing decode pipeline to catch base64, URL-encoded, hex, and
+// Unicode escape evasion attempts before running DLP regex patterns.
+// =============================================================================
+
+const BASE64_REGEX = /[A-Za-z0-9+/]{20,}={0,2}/g;
+const URL_ENCODED_REGEX = /(?:%[0-9A-Fa-f]{2}){4,}/g;
+const HEX_REGEX = /(?:\\x[0-9a-fA-F]{2}){4,}/g;
+const UNICODE_REGEX = /(?:\\u[0-9a-fA-F]{4}){2,}/g;
+
+/**
+ * Attempt to decode a base64 string. Returns null if invalid.
+ */
+function tryBase64Decode(encoded: string): string | null {
+  try {
+    const decoded = atob(encoded);
+    // Validate that the decoded string contains printable characters
+    if (/[\x20-\x7E]{4,}/.test(decoded)) {
+      return decoded;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Attempt to decode URL-encoded sequences.
+ */
+function tryURLDecode(encoded: string): string | null {
+  try {
+    const decoded = decodeURIComponent(encoded);
+    if (decoded !== encoded) {
+      return decoded;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decode hex escape sequences like \x41\x42\x43
+ */
+function tryHexDecode(encoded: string): string | null {
+  try {
+    const decoded = encoded.replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) =>
+      String.fromCharCode(parseInt(hex, 16))
+    );
+    if (decoded !== encoded) {
+      return decoded;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decode Unicode escape sequences like \u0041\u0042
+ */
+function tryUnicodeDecode(encoded: string): string | null {
+  try {
+    const decoded = encoded.replace(/\\u([0-9a-fA-F]{4})/g, (_, code) =>
+      String.fromCharCode(parseInt(code, 16))
+    );
+    if (decoded !== encoded) {
+      return decoded;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run the decode pipeline on input text. Returns an array of decoded strings
+ * (may be empty if no encodings detected). Does NOT include the original text.
+ */
+export function decodeEvasions(text: string): string[] {
+  const decoded: string[] = [];
+
+  // Base64 detection
+  BASE64_REGEX.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = BASE64_REGEX.exec(text)) !== null) {
+    const result = tryBase64Decode(match[0]);
+    if (result) decoded.push(result);
+  }
+
+  // URL-encoded detection
+  URL_ENCODED_REGEX.lastIndex = 0;
+  while ((match = URL_ENCODED_REGEX.exec(text)) !== null) {
+    const result = tryURLDecode(match[0]);
+    if (result) decoded.push(result);
+  }
+
+  // Hex escape detection
+  HEX_REGEX.lastIndex = 0;
+  while ((match = HEX_REGEX.exec(text)) !== null) {
+    const result = tryHexDecode(match[0]);
+    if (result) decoded.push(result);
+  }
+
+  // Unicode escape detection
+  UNICODE_REGEX.lastIndex = 0;
+  while ((match = UNICODE_REGEX.exec(text)) !== null) {
+    const result = tryUnicodeDecode(match[0]);
+    if (result) decoded.push(result);
+  }
+
+  return decoded;
+}
+
+// Sensitive file extensions that should be blocked on upload to AI tools
+export const SENSITIVE_FILE_EXTENSIONS = [
+  '.env', '.pem', '.key', '.csv', '.sql', '.json', '.xlsx',
+  '.p12', '.pfx', '.keystore', '.jks', '.credentials',
+];
+
+// Text-based file extensions that can be read and scanned
+export const SCANNABLE_FILE_EXTENSIONS = [
+  '.txt', '.csv', '.json', '.env', '.sql', '.md', '.log',
+  '.yml', '.yaml', '.xml', '.conf', '.cfg', '.ini', '.properties',
+];
+
+// Sensitive file types for download monitoring
+export const SENSITIVE_DOWNLOAD_EXTENSIONS = [
+  '.py', '.js', '.ts', '.sql', '.env', '.key', '.pem',
+  '.csv', '.json', '.xlsx', '.zip', '.tar', '.gz',
+];
+
 // Helper: Check if a domain is a known AI tool
 export function getAIToolName(hostname: string): string | null {
   // Check exact match first

@@ -25,7 +25,7 @@ export interface DLPMatch {
 // Event sent to the backend for logging
 export interface SecurityEvent {
   id: string;
-  type: 'DLP_VIOLATION' | 'AI_TOOL_ACCESS' | 'CLIPBOARD_PASTE' | 'FILE_UPLOAD';
+  type: 'DLP_VIOLATION' | 'AI_TOOL_ACCESS' | 'CLIPBOARD_PASTE' | 'FILE_UPLOAD' | 'DOWNLOAD_FROM_AI' | 'PRINT_BLOCKED';
   matches: DLPMatch[];
   url: string;
   domain: string;

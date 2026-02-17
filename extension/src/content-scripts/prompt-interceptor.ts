@@ -1,5 +1,4 @@
-import { getAIToolName } from '../shared/patterns';
-import { DETECTION_PATTERNS } from '../shared/patterns';
+import { getAIToolName, DETECTION_PATTERNS, decodeEvasions, SENSITIVE_FILE_EXTENSIONS, SCANNABLE_FILE_EXTENSIONS } from '../shared/patterns';
 import { SEVERITY_ACTIONS, DLPMatch, Action, ExtensionMessage } from '../shared/types';
 
 // =============================================================================
@@ -14,6 +13,15 @@ import { SEVERITY_ACTIONS, DLPMatch, Action, ExtensionMessage } from '../shared/
 
 const hostname = window.location.hostname;
 const toolName = getAIToolName(hostname);
+
+// ─── SESSION BUFFER (split-message evasion detection) ────────────
+let sessionBuffer = '';
+let sessionBufferLastUpdate = Date.now();
+const SESSION_BUFFER_MAX = 50 * 1024; // 50KB cap
+const SESSION_BUFFER_TIMEOUT = 10 * 60 * 1000; // 10 minutes
+
+// ─── TYPING DEBOUNCE STATE ──────────────────────────────────────
+const debounceTimers = new WeakMap<HTMLElement, ReturnType<typeof setTimeout>>();
 
 // Only activate on AI tool pages
 if (toolName) {
@@ -43,13 +51,26 @@ function scanTextSync(text: string): DLPMatch[] {
   const matches: DLPMatch[] = [];
   const seen = new Set<string>();
 
+  // Scan the original text
+  scanWithPatterns(text, matches, seen);
+
+  // Scan decoded versions (base64, URL-encoded, hex, unicode evasion)
+  const decodedTexts = decodeEvasions(text);
+  for (const decoded of decodedTexts) {
+    scanWithPatterns(decoded, matches, seen);
+  }
+
+  return matches;
+}
+
+function scanWithPatterns(text: string, matches: DLPMatch[], seen: Set<string>): void {
   for (const pattern of DETECTION_PATTERNS) {
     pattern.regex.lastIndex = 0;
 
     let match: RegExpExecArray | null;
     while ((match = pattern.regex.exec(text)) !== null) {
       const matchedText = match[0];
-      const dedupeKey = `${pattern.name}:${match.index}`;
+      const dedupeKey = `${pattern.name}:${matchedText}`;
 
       if (seen.has(dedupeKey)) continue;
       seen.add(dedupeKey);
@@ -73,8 +94,6 @@ function scanTextSync(text: string): DLPMatch[] {
       });
     }
   }
-
-  return matches;
 }
 
 function maskText(text: string): string {
@@ -106,8 +125,25 @@ function initPromptInterception() {
   // 4. Intercept send button clicks
   observeSendButtons();
 
-  // 5. Watch for dynamically added input fields
+  // 5. Watch for dynamically added input fields (+ file inputs)
   observeNewInputs();
+
+  // 6. Drag & Drop blocking
+  document.addEventListener('dragover', handleDragOver, true);
+  document.addEventListener('drop', handleDrop, true);
+
+  // 7. Typing/input detection (debounced)
+  document.addEventListener('input', handleInputEvent, true);
+
+  // 8. Right-click / context menu paste detection
+  document.addEventListener('contextmenu', handleContextMenu, true);
+
+  // 9. Print / Print-to-PDF blocking
+  window.addEventListener('beforeprint', handleBeforePrint);
+  interceptWindowPrint();
+
+  // 10. Autofill detection
+  initAutofillBlocking();
 }
 
 // ─── FORM SUBMIT HANDLER ────────────────────────────────────────
@@ -164,10 +200,20 @@ function observeNewInputs() {
     for (const mutation of mutations) {
       mutation.addedNodes.forEach((node) => {
         if (node instanceof HTMLElement) {
+          // Watch text inputs for paste
           const inputs = node.querySelectorAll?.('textarea, [contenteditable="true"]');
           inputs?.forEach((input) => {
             input.addEventListener('paste', handlePaste, true);
           });
+          // Watch file inputs for upload blocking
+          const fileInputs = node.querySelectorAll?.('input[type="file"]');
+          fileInputs?.forEach((input) => {
+            attachFileInputListener(input as HTMLInputElement);
+          });
+          // If the node itself is a file input
+          if (node instanceof HTMLInputElement && node.type === 'file') {
+            attachFileInputListener(node);
+          }
         }
       });
     }
@@ -177,6 +223,11 @@ function observeNewInputs() {
 
   document.querySelectorAll('textarea, [contenteditable="true"]').forEach((input) => {
     input.addEventListener('paste', handlePaste, true);
+  });
+
+  // Attach to existing file inputs
+  document.querySelectorAll('input[type="file"]').forEach((input) => {
+    attachFileInputListener(input as HTMLInputElement);
   });
 }
 
@@ -228,7 +279,21 @@ function handlePaste(event: Event) {
 // This is the critical fix: scan runs synchronously so we can block
 // the event BEFORE the browser processes it.
 function scanAndBlock(text: string, event: Event, source: string): void {
-  const matches = scanTextSync(text);
+  // Scan the current text
+  let matches = scanTextSync(text);
+
+  // Also check session buffer for split-message evasion
+  appendToSessionBuffer(text);
+  if (sessionBuffer.length > text.length) {
+    const bufferMatches = scanTextSync(sessionBuffer);
+    // Merge any new matches from the buffer that weren't in the current text
+    const currentTypes = new Set(matches.map(m => `${m.type}:${m.matchedText}`));
+    for (const bm of bufferMatches) {
+      if (!currentTypes.has(`${bm.type}:${bm.matchedText}`)) {
+        matches.push(bm);
+      }
+    }
+  }
 
   if (matches.length === 0) return;
 
@@ -239,11 +304,6 @@ function scanAndBlock(text: string, event: Event, source: string): void {
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-
-    // For paste events, also clear the clipboard data from reaching the input
-    if (event instanceof ClipboardEvent) {
-      // The preventDefault above stops the paste
-    }
 
     showBlockedOverlay(matches);
   } else if (action === 'WARN_LOG') {
@@ -256,6 +316,26 @@ function scanAndBlock(text: string, event: Event, source: string): void {
     payload: { text, source, url: window.location.href },
   } as ExtensionMessage);
 }
+
+// ─── SESSION BUFFER (split-message evasion) ─────────────────────
+function appendToSessionBuffer(text: string): void {
+  const now = Date.now();
+  // Clear buffer if timed out
+  if (now - sessionBufferLastUpdate > SESSION_BUFFER_TIMEOUT) {
+    sessionBuffer = '';
+  }
+  sessionBufferLastUpdate = now;
+  sessionBuffer += '\n' + text;
+  // Cap buffer size
+  if (sessionBuffer.length > SESSION_BUFFER_MAX) {
+    sessionBuffer = sessionBuffer.slice(-SESSION_BUFFER_MAX);
+  }
+}
+
+// Clear session buffer on page navigation
+window.addEventListener('beforeunload', () => {
+  sessionBuffer = '';
+});
 
 // ─── UI: BLOCKED OVERLAY ────────────────────────────────────────
 function showBlockedOverlay(matches: DLPMatch[]) {
@@ -360,6 +440,426 @@ function showWarningBanner(matches: DLPMatch[]) {
   });
 
   setTimeout(() => banner.remove(), 8000);
+}
+
+// ─── DRAG & DROP HANDLERS ───────────────────────────────────────
+function handleDragOver(event: DragEvent) {
+  // Prevent default to signal we're handling the drop
+  event.preventDefault();
+}
+
+function handleDrop(event: DragEvent) {
+  // Check for dropped files first
+  const files = event.dataTransfer?.files;
+  if (files && files.length > 0) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const fileNames = Array.from(files).map(f => f.name);
+    console.log('[DLP] BLOCKED file drop:', fileNames);
+
+    showBlockedOverlay([{
+      type: 'File Drop',
+      category: 'File Upload',
+      severity: 'HIGH',
+      action: 'BLOCK_LOG',
+      matchedText: fileNames.join(', '),
+      context: `Dropped ${files.length} file(s): ${fileNames.join(', ')}`,
+      timestamp: Date.now(),
+    }]);
+
+    chrome.runtime.sendMessage({
+      type: 'SCAN_TEXT',
+      payload: {
+        text: `[FILE DROP] ${fileNames.join(', ')}`,
+        source: 'file_drop',
+        url: window.location.href,
+      },
+    } as ExtensionMessage);
+    return;
+  }
+
+  // Check for dropped text
+  const text = event.dataTransfer?.getData('text/plain');
+  if (text && text.length > 5) {
+    console.log('[DLP] Drop intercepted, scanning...');
+    scanAndBlock(text, event, 'drag_drop');
+  }
+}
+
+// ─── FILE UPLOAD BLOCKING ───────────────────────────────────────
+function attachFileInputListener(input: HTMLInputElement) {
+  if ((input as any).__dlpFileListenerAttached) return;
+  (input as any).__dlpFileListenerAttached = true;
+
+  input.addEventListener('change', handleFileInputChange, true);
+}
+
+function handleFileInputChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = input.files;
+  if (!files || files.length === 0) return;
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
+
+    // Block sensitive file types outright
+    if (SENSITIVE_FILE_EXTENSIONS.includes(ext)) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      // Clear the file input
+      input.value = '';
+
+      console.log(`[DLP] BLOCKED file upload: ${file.name} (${ext})`);
+      showBlockedOverlay([{
+        type: 'Sensitive File Upload',
+        category: 'File Upload',
+        severity: 'CRITICAL',
+        action: 'BLOCK_ALERT',
+        matchedText: file.name,
+        context: `File: ${file.name} (${formatFileSize(file.size)}, type: ${file.type || 'unknown'})`,
+        timestamp: Date.now(),
+      }]);
+
+      chrome.runtime.sendMessage({
+        type: 'SCAN_TEXT',
+        payload: {
+          text: `[FILE UPLOAD BLOCKED] ${file.name} (${ext}, ${formatFileSize(file.size)})`,
+          source: 'file_upload',
+          url: window.location.href,
+        },
+      } as ExtensionMessage);
+      return;
+    }
+
+    // For scannable text files, read and scan contents
+    if (SCANNABLE_FILE_EXTENSIONS.includes(ext) && file.size < 1024 * 1024) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const content = reader.result as string;
+        const matches = scanTextSync(content);
+        if (matches.length > 0) {
+          const action = getHighestAction(matches);
+          if (action === 'BLOCK_ALERT' || action === 'BLOCK_LOG') {
+            // Can't preventDefault after async read, so clear the input
+            input.value = '';
+            showBlockedOverlay(matches);
+
+            chrome.runtime.sendMessage({
+              type: 'SCAN_TEXT',
+              payload: {
+                text: content,
+                source: 'file_upload_content',
+                url: window.location.href,
+              },
+            } as ExtensionMessage);
+          } else if (action === 'WARN_LOG') {
+            showWarningBanner(matches);
+          }
+        }
+      };
+      reader.readAsText(file);
+    }
+  }
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// ─── TYPING / INPUT DETECTION (DEBOUNCED) ───────────────────────
+function handleInputEvent(event: Event) {
+  const target = event.target as HTMLElement;
+  if (!isInputElement(target)) return;
+
+  // Clear any existing debounce timer for this element
+  const existingTimer = debounceTimers.get(target);
+  if (existingTimer) clearTimeout(existingTimer);
+
+  // Set a new debounce timer (1500ms)
+  const timer = setTimeout(() => {
+    const text = getInputText(target);
+    if (!text || text.length <= 10) return;
+
+    const matches = scanTextSync(text);
+    if (matches.length === 0) return;
+
+    const action = getHighestAction(matches);
+
+    // Show persistent warning bar (not blocking — bad UX to block mid-typing)
+    // The existing Enter/button submit handlers will catch and block on submit
+    if (action === 'BLOCK_ALERT' || action === 'BLOCK_LOG') {
+      showPersistentInputWarning(target, matches);
+    } else if (action === 'WARN_LOG') {
+      showPersistentInputWarning(target, matches);
+    }
+  }, 1500);
+
+  debounceTimers.set(target, timer);
+}
+
+function showPersistentInputWarning(target: HTMLElement, matches: DLPMatch[]) {
+  // Remove existing warning for this element
+  const existingWarning = target.parentElement?.querySelector('.dlp-input-warning');
+  existingWarning?.remove();
+
+  const types = [...new Set(matches.map(m => m.type))];
+  const severity = matches[0]?.severity || 'HIGH';
+
+  const warning = document.createElement('div');
+  warning.className = 'dlp-input-warning';
+  warning.style.cssText = `
+    background: ${severity === 'CRITICAL' ? '#FEF2F2' : '#FFFBEB'};
+    border: 1px solid ${severity === 'CRITICAL' ? '#FECACA' : '#FDE68A'};
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 4px;
+    font-size: 13px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    color: ${severity === 'CRITICAL' ? '#991B1B' : '#92400E'};
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    z-index: 999997;
+  `;
+  warning.innerHTML = `
+    <span style="font-weight: 600;">Sensitive data detected:</span>
+    <span>${types.join(', ')}</span>
+    <span style="margin-left: auto; font-size: 12px; opacity: 0.7;">Submission will be blocked</span>
+  `;
+
+  target.parentElement?.insertBefore(warning, target);
+}
+
+// ─── CONTEXT MENU (RIGHT-CLICK PASTE) DETECTION ─────────────────
+function handleContextMenu(event: Event) {
+  const target = event.target as HTMLElement;
+  if (!isInputElement(target)) return;
+
+  console.log('[DLP] Context menu opened on input element');
+
+  // After context menu closes, check for content changes via input event
+  // Some browsers bypass the paste event for "Paste and Match Style"
+  const beforeText = getInputText(target);
+  const checkForPaste = () => {
+    const afterText = getInputText(target);
+    if (afterText !== beforeText && afterText.length > beforeText.length) {
+      const newText = afterText;
+      if (newText.length > 5) {
+        const matches = scanTextSync(newText);
+        if (matches.length > 0) {
+          const action = getHighestAction(matches);
+          if (action === 'BLOCK_ALERT' || action === 'BLOCK_LOG') {
+            // Revert the input to before the paste
+            if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+              target.value = beforeText;
+            } else {
+              target.textContent = beforeText;
+            }
+            showBlockedOverlay(matches);
+
+            chrome.runtime.sendMessage({
+              type: 'SCAN_TEXT',
+              payload: { text: newText, source: 'context_menu_paste', url: window.location.href },
+            } as ExtensionMessage);
+          } else if (action === 'WARN_LOG') {
+            showWarningBanner(matches);
+          }
+        }
+      }
+    }
+  };
+
+  // Check shortly after context menu action
+  setTimeout(checkForPaste, 300);
+  setTimeout(checkForPaste, 600);
+  setTimeout(checkForPaste, 1000);
+}
+
+// ─── PRINT / PRINT-TO-PDF BLOCKING ─────────────────────────────
+function handleBeforePrint(event: Event) {
+  // Scan visible conversation content on the page
+  const conversationText = getVisibleConversationText();
+  if (!conversationText || conversationText.length <= 10) return;
+
+  const matches = scanTextSync(conversationText);
+  if (matches.length === 0) return;
+
+  const action = getHighestAction(matches);
+  if (action === 'BLOCK_ALERT' || action === 'BLOCK_LOG') {
+    event.preventDefault();
+    console.log('[DLP] BLOCKED print — page contains sensitive data');
+
+    showBlockedOverlay([{
+      type: 'Print Blocked',
+      category: 'Data Exfiltration',
+      severity: 'HIGH',
+      action: 'BLOCK_LOG',
+      matchedText: 'Page contains sensitive data',
+      context: `Attempted to print ${toolName} page with ${matches.length} sensitive data match(es)`,
+      timestamp: Date.now(),
+    }]);
+
+    chrome.runtime.sendMessage({
+      type: 'SCAN_TEXT',
+      payload: {
+        text: `[PRINT BLOCKED] ${matches.map(m => m.type).join(', ')}`,
+        source: 'print_blocked',
+        url: window.location.href,
+      },
+    } as ExtensionMessage);
+  }
+}
+
+function interceptWindowPrint() {
+  const originalPrint = window.print.bind(window);
+  window.print = () => {
+    const conversationText = getVisibleConversationText();
+    if (conversationText && conversationText.length > 10) {
+      const matches = scanTextSync(conversationText);
+      if (matches.length > 0) {
+        const action = getHighestAction(matches);
+        if (action === 'BLOCK_ALERT' || action === 'BLOCK_LOG') {
+          console.log('[DLP] BLOCKED window.print() — sensitive data detected');
+          showBlockedOverlay([{
+            type: 'Print Blocked',
+            category: 'Data Exfiltration',
+            severity: 'HIGH',
+            action: 'BLOCK_LOG',
+            matchedText: 'Page contains sensitive data',
+            context: `window.print() blocked — ${matches.length} sensitive data match(es)`,
+            timestamp: Date.now(),
+          }]);
+          return;
+        }
+      }
+    }
+    originalPrint();
+  };
+}
+
+function getVisibleConversationText(): string {
+  // Common selectors for conversation content across AI tools
+  const selectors = [
+    '[data-message-author-role]',  // ChatGPT
+    '.prose',                       // Claude
+    '.message-content',             // Generic
+    '.response-content',            // Generic
+    'article',                      // Some AI tools
+    '[class*="message"]',           // Generic pattern
+    '[class*="conversation"]',      // Generic pattern
+  ];
+
+  let text = '';
+  for (const selector of selectors) {
+    document.querySelectorAll(selector).forEach(el => {
+      text += ' ' + (el.textContent || '');
+    });
+    if (text.length > 100) break; // Found content, stop looking
+  }
+
+  return text.trim();
+}
+
+// ─── AUTOFILL / PASSWORD MANAGER BLOCKING ───────────────────────
+function initAutofillBlocking() {
+  // Set autocomplete="off" on all input fields within AI tool pages
+  disableAutocompleteOnInputs();
+
+  // Detect Chrome autofill animation
+  const style = document.createElement('style');
+  style.textContent = `
+    @keyframes dlp-autofill-detect {
+      from { opacity: 1; }
+      to { opacity: 1; }
+    }
+    input:-webkit-autofill {
+      animation-name: dlp-autofill-detect !important;
+    }
+  `;
+  document.head.appendChild(style);
+
+  document.addEventListener('animationstart', (event) => {
+    if (event.animationName === 'dlp-autofill-detect') {
+      const target = event.target as HTMLInputElement;
+      // Small delay to let autofill complete
+      setTimeout(() => {
+        const text = target.value;
+        if (text && text.length > 5) {
+          const matches = scanTextSync(text);
+          if (matches.length > 0) {
+            const action = getHighestAction(matches);
+            if (action === 'BLOCK_ALERT' || action === 'BLOCK_LOG') {
+              target.value = '';
+              showBlockedOverlay(matches);
+            } else if (action === 'WARN_LOG') {
+              showWarningBanner(matches);
+            }
+          }
+        }
+      }, 100);
+    }
+  });
+
+  // Detect rapid input events (autofill fills multiple fields within 50ms)
+  let rapidInputCount = 0;
+  let rapidInputTimer: ReturnType<typeof setTimeout> | null = null;
+
+  document.addEventListener('input', (event) => {
+    const target = event.target as HTMLElement;
+    if (!(target instanceof HTMLInputElement)) return;
+
+    rapidInputCount++;
+    if (rapidInputTimer) clearTimeout(rapidInputTimer);
+
+    rapidInputTimer = setTimeout(() => {
+      if (rapidInputCount >= 3) {
+        // Likely autofill — scan all input values
+        console.log('[DLP] Rapid input detected (possible autofill)');
+        document.querySelectorAll('input').forEach(input => {
+          if (input.value && input.value.length > 5) {
+            const matches = scanTextSync(input.value);
+            if (matches.length > 0) {
+              const action = getHighestAction(matches);
+              if (action === 'BLOCK_ALERT' || action === 'BLOCK_LOG') {
+                input.value = '';
+                showBlockedOverlay(matches);
+              }
+            }
+          }
+        });
+      }
+      rapidInputCount = 0;
+    }, 50);
+  });
+}
+
+function disableAutocompleteOnInputs() {
+  document.querySelectorAll('input, textarea').forEach(el => {
+    el.setAttribute('autocomplete', 'off');
+  });
+
+  // Also observe for new inputs and disable autocomplete on them
+  const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      mutation.addedNodes.forEach(node => {
+        if (node instanceof HTMLElement) {
+          if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+            node.setAttribute('autocomplete', 'off');
+          }
+          node.querySelectorAll?.('input, textarea').forEach(el => {
+            el.setAttribute('autocomplete', 'off');
+          });
+        }
+      });
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 // ─── HELPERS ────────────────────────────────────────────────────
